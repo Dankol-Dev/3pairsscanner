@@ -27,6 +27,7 @@ export type Signal = {
   regime: string | null;
   atr_pctl: number | null;
   auto_executed: boolean;
+  mode: string | null;  // "day" or "scalp"
   tp1_hit: boolean;
   tp2_hit: boolean;
   tp3_hit: boolean;
