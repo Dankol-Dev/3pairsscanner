@@ -3169,16 +3169,21 @@ def backtest(df_htf_raw, df_ltf_raw, max_hold_bars=MAX_HOLD_BARS,
     parameters as the live engine. If provided, it overrides the individual
     parameters. `pair_name` is needed for the scalp spread-viability filter."""
 
-    # Profile takes precedence over individual params.
+    # Individual params take precedence over profile defaults. The sweep
+    # passes BOTH a profile AND per-axis overrides; the old code let the
+    # profile silently overwrite the overrides, producing identical stats
+    # for every grid cell.
+    mode = "day"
     if profile is not None:
-        atr_stop_mult = profile["atr_stop_mult"]
-        min_htf_grade = profile["min_htf_grade"]
-        min_rr = profile["min_rr"]
-        tp_rr = profile["tp_rr"]
-        min_ltf_confirmations = profile["min_ltf_confirmations"]
-        required_session = profile["required_session"]
+        atr_stop_mult = atr_stop_mult if atr_stop_mult is not None else profile["atr_stop_mult"]
+        min_htf_grade = min_htf_grade if min_htf_grade is not None else profile["min_htf_grade"]
+        min_rr = min_rr if min_rr is not None else profile["min_rr"]
+        tp_rr = tp_rr if tp_rr is not None else profile["tp_rr"]
+        min_ltf_confirmations = min_ltf_confirmations if min_ltf_confirmations is not None else profile["min_ltf_confirmations"]
+        required_session = required_session if required_session is not None else profile["required_session"]
         max_hold_bars = profile["max_hold_bars"]
         is_scalp = profile["mode"] == "scalp"
+        mode = profile["mode"]
     else:
         is_scalp = False
         if atr_stop_mult is None:
@@ -3252,7 +3257,9 @@ def backtest(df_htf_raw, df_ltf_raw, max_hold_bars=MAX_HOLD_BARS,
         trade = build_trade_plan(htf_setup, ltf_conf,
                                  atr_stop_mult=atr_stop_mult,
                                  min_rr=min_rr,
-                                 tp_rr=tp_rr)
+                                 tp_rr=tp_rr,
+                                 pair_name=pair_name,
+                                 mode=mode)
         if trade is None:
             i += 1
             continue
