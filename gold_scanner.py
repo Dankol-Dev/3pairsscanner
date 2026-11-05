@@ -551,6 +551,17 @@ SCALP_REQUIRED_SESSION = "overlap"
 # flow hasn't arrived or has already left) that produce false breakouts.
 SESSION_EDGE_BUFFER_MIN = 10
 
+# --- MINIMUM VOLUME FLOOR ---------------------------------------------------
+# The existing volume check is RELATIVE: the confirmation candle must beat
+# its own 20-bar average. In a thin session that average itself collapses,
+# so a candle can pass "above average" while still being dead volume in
+# absolute terms. This floor adds an absolute gate: the candle's volume
+# must also clear a fraction of a LONGER-lookback baseline (50 bars) that
+# spans multiple sessions, so the reference reflects what real liquidity
+# looks like across the day, not just the current (possibly thin) window.
+ENABLE_MIN_VOLUME_FLOOR = True
+MIN_VOLUME_FLOOR_FRACTION = 0.7  # candle volume must be >= this * vol_ma50
+
 
 # --------------------------------------------------------------------------
 # 1. DATA
@@ -964,6 +975,10 @@ def compute_indicators(df):
     df["adx14"] = adx(df, ADX_PERIOD)
     # Rolling mean volume for an expansion check on the confirmation candle.
     df["vol_ma20"] = df["volume"].rolling(20, min_periods=1).mean()
+    # Longer-lookback baseline spanning multiple sessions — used by the
+    # minimum-volume floor so the reference reflects what real liquidity
+    # looks like across the day, not just the current (possibly thin) session.
+    df["vol_ma50"] = df["volume"].rolling(50, min_periods=1).mean()
     return df
 
 
@@ -2135,6 +2150,10 @@ def evaluate_setup(df, at=-1, swing_window=20):
         last["vol_ma20"] = float(last_row["vol_ma20"])
     else:
         last["vol_ma20"] = float("nan")
+    if "vol_ma50" in last_row.index:
+        last["vol_ma50"] = float(last_row["vol_ma50"])
+    else:
+        last["vol_ma50"] = float("nan")
     window_start = max(0, pos - swing_window + 1)
     swing_high, swing_low = swing_levels(df.iloc[window_start:pos + 1], window=swing_window)
     swing_high, swing_low = float(swing_high), float(swing_low)
@@ -2249,13 +2268,24 @@ def evaluate_setup(df, at=-1, swing_window=20):
         # Volume expansion on the confirmation candle (not dead volume).
         # The expansion multiple is regime-dependent (tightened in high-vol
         # where volume is already elevated, so the bar isn't double-counted).
+        # An absolute floor is also enforced: the candle's volume must clear
+        # a fraction of a longer 50-bar baseline that spans sessions, so a
+        # candle can't pass on "above a thin session's average" alone.
         vol_ma = last["vol_ma20"]
+        vol_ma50 = last["vol_ma50"]
         if not math.isnan(vol_ma) and vol_ma > 0:
             vol_now = float(df["volume"].iloc[pos])
-            vol_ok = vol_now > vol_ma * vol_mult
+            vol_expansion_ok = vol_now > vol_ma * vol_mult
         else:
-            vol_ok = False
-        checklist.append((f"Volume expansion on confirmation candle (> {vol_mult:.2f}x avg)", vol_ok))
+            vol_expansion_ok = False
+        if ENABLE_MIN_VOLUME_FLOOR and not math.isnan(vol_ma50) and vol_ma50 > 0:
+            vol_floor_ok = float(df["volume"].iloc[pos]) >= MIN_VOLUME_FLOOR_FRACTION * vol_ma50
+        else:
+            vol_floor_ok = True  # FAIL OPEN when baseline unavailable
+        vol_ok = vol_expansion_ok and vol_floor_ok
+        checklist.append((
+            f"Volume expansion on confirmation candle (> {vol_mult:.2f}x avg"
+            f" and >= {MIN_VOLUME_FLOOR_FRACTION:.1f}x 50-bar baseline)", vol_ok))
         if vol_ok:
             score += 1
             reasons.append(checklist[-1][0])
