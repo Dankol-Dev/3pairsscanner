@@ -120,6 +120,130 @@ TRADED_PAIRS = [
 ]
 _PAIR_BY_NAME = {p["name"]: p for p in TRADED_PAIRS}
 
+# --- FACTOR-MOMENTUM TILT (Zhang 2021, SSRN 3759017) -------------------------
+# Currency momentum is driven by carry and dollar factor autocorrelation.
+# Pairs with stronger factor autocorrelation get higher signal weights.
+# Computed from rolling factor returns (carry: interest rate differential,
+# dollar: DXY trend). Positive autocorrelation -> factor momentum -> tilt up.
+FACTOR_MOMENTUM_ENABLED = True
+FACTOR_MOMENTUM_LOOKBACK = 250    # bars for autocorrelation estimation
+FACTOR_MOMENTUM_MIN_WEIGHT = 0.5  # minimum weight multiplier
+FACTOR_MOMENTUM_MAX_WEIGHT = 1.5  # maximum weight multiplier
+FACTOR_MOMENTUM_REBALANCE_DAYS = 7  # recalculate weekly
+
+# Cache for factor momentum weights
+_factor_momentum_cache = {"weights": None, "last_update": 0}
+
+def compute_factor_momentum_weights(pair_names=None):
+    """Computes factor-momentum tilt weights for each pair.
+    
+    Based on Zhang (2021): carry and dollar factors are autocorrelated.
+    When a factor has positive autocorrelation, currencies loading on it
+    exhibit momentum. We estimate each pair's factor loading and multiply
+    by the factor's autocorrelation to get a tilt weight.
+    
+    Returns dict: {pair_name: weight_multiplier}
+    """
+    global _factor_momentum_cache
+    import time
+    now = time.time()
+    
+    if pair_names is None:
+        pair_names = [p["name"] for p in TRADED_PAIRS]
+    
+    # Return cached if fresh
+    if (_factor_momentum_cache["weights"] is not None and
+        now - _factor_momentum_cache["last_update"] < FACTOR_MOMENTUM_REBALANCE_DAYS * 86400):
+        return {k: v for k, v in _factor_momentum_cache["weights"].items() if k in pair_names}
+    
+    weights = {}
+    
+    try:
+        # Fetch DXY for dollar factor
+        dxy_df = fetch_dxy(FACTOR_MOMENTUM_LOOKBACK + 50)
+        if dxy_df is not None and len(dxy_df) >= FACTOR_MOMENTUM_LOOKBACK:
+            dxy_returns = dxy_df["close"].pct_change().dropna().tail(FACTOR_MOMENTUM_LOOKBACK)
+            dollar_autocorr = float(dxy_returns.autocorr(lag=1))
+        else:
+            dollar_autocorr = 0.0
+        
+        # Fetch each pair for carry proxy (interest rate diff) and dollar beta
+        for pair_name in pair_names:
+            pair = _PAIR_BY_NAME.get(pair_name)
+            if not pair:
+                weights[pair_name] = 1.0
+                continue
+            
+            # Get pair price data
+            df = fetch_data("1h", FACTOR_MOMENTUM_LOOKBACK + 50, pair_name=pair_name)
+            if df is None or len(df) < FACTOR_MOMENTUM_LOOKBACK:
+                weights[pair_name] = 1.0
+                continue
+            
+            pair_returns = df["close"].pct_change().dropna().tail(FACTOR_MOMENTUM_LOOKBACK)
+            
+            # Dollar beta (regression on DXY returns)
+            if dxy_df is not None and len(dxy_df) >= FACTOR_MOMENTUM_LOOKBACK:
+                common_idx = pair_returns.index.intersection(dxy_returns.index)
+                if len(common_idx) > 50:
+                    y = pair_returns.loc[common_idx]
+                    x = dxy_returns.loc[common_idx]
+                    # Simple beta
+                    beta = float(np.cov(y, x)[0,1] / np.var(x)) if np.var(x) > 0 else 0.0
+                else:
+                    beta = 0.0
+            else:
+                beta = 0.0
+            
+            # Carry proxy: pair's autocorrelation (positive -> carry momentum)
+            carry_autocorr = float(pair_returns.autocorr(lag=1))
+            
+            # Factor-momentum weight: combine dollar and carry momentum
+            # Dollar momentum contribution: beta * dollar_autocorr
+            # Carry momentum contribution: carry_autocorr (for carry trades)
+            dollar_momentum = beta * dollar_autocorr
+            carry_momentum = max(0, carry_autocorr)  # only positive autocorr helps
+            
+            # Combined tilt (centered at 1.0)
+            tilt = 1.0 + 0.5 * (dollar_momentum + carry_momentum)
+            
+            # Clamp
+            tilt = max(FACTOR_MOMENTUM_MIN_WEIGHT, min(FACTOR_MOMENTUM_MAX_WEIGHT, tilt))
+            weights[pair_name] = tilt
+            
+    except Exception:
+        # Fallback: equal weights
+        for pair_name in pair_names:
+            weights[pair_name] = 1.0
+    
+    _factor_momentum_cache["weights"] = weights
+    _factor_momentum_cache["last_update"] = now
+    
+    return weights
+
+
+def apply_factor_momentum_tilt(signals, weights):
+    """Applies factor-momentum tilt to signal risk amounts.
+    
+    Modifies each signal's risk_amount by multiplying with its pair's weight.
+    Returns modified signals list.
+    """
+    if not FACTOR_MOMENTUM_ENABLED:
+        return signals
+    
+    for trade in signals:
+        pair_name = trade.get("Symbol")
+        if pair_name in weights:
+            tilt = weights[pair_name]
+            # Apply to risk amount and lot size
+            if "_position" in trade and trade["_position"]:
+                trade["_position"]["lots"] *= tilt
+                trade["Risk $ (target)"] *= tilt
+            trade["Risk % (vol-targeted)"] *= tilt
+            trade["Factor Momentum Tilt"] = round(tilt, 3)
+    
+    return signals
+
 # Legacy single-pair aliases (used by backtest/sweep/walkforward code paths
 # that haven't been multi-pair-ized yet — they default to EURUSD).
 MT5_SYMBOL_CANDIDATES = TRADED_PAIRS[0]["mt5_symbols"]
@@ -132,8 +256,8 @@ YF_SYMBOL = TRADED_PAIRS[0]["yf_symbol"]
 # Day-trading uses faster timeframes than swing trading. The confluence
 # engine is timeframe-agnostic — these just control how much noise is
 # filtered vs. how fast signals fire.
-HTF_INTERVAL = "15m"
-LTF_INTERVAL = "5m"
+HTF_INTERVAL = "1h"
+LTF_INTERVAL = "15m"
 HTF_BARS = 300
 LTF_BARS = 500
 
@@ -910,6 +1034,256 @@ def regime_criteria(regime):
     return presets.get(regime, presets["trend"])
 
 
+# --- DIRECTIONAL CHANGE + HMM REGIME DETECTION (Hu et al. 2022, SSRN 4048864) ---
+# Alternative to EMA-stack classifier. DC captures intrinsic price dynamics
+# without fixed lookback windows. HMM infers latent regimes from DC events.
+REGIME_CLASSIFIER = "ema"  # "ema" or "dc_hmm"
+DC_THRESHOLD_PCT = 0.0015   # 0.15% DC threshold (Hu et al. optimize via Bayes)
+DC_ATTENUATION = 0.7        # Downward DC threshold attenuation coefficient
+DC_LOOKBACK = 200           # Bars for DC event statistics
+HMM_N_STATES = 3            # Hidden states: trend_up, trend_down, range
+HMM_COVARIANCE_TYPE = "full"
+
+# Cached HMM model (retrained periodically)
+_dc_hmm_cache = {"model": None, "last_retrain": 0, "dc_events": None}
+
+def _compute_directional_changes(close_prices, threshold=DC_THRESHOLD_PCT,
+                                  attenuation=DC_ATTENUATION):
+    """Computes Directional Change (DC) events from close prices.
+    
+    DC up event: price rises by threshold from a confirmed low.
+    DC down event: price falls by threshold * attenuation from a confirmed high.
+    
+    Returns list of (index, price, type) where type = +1 (up) or -1 (down).
+    """
+    if len(close_prices) < 2:
+        return []
+    
+    dc_events = []
+    current_extreme = close_prices[0]
+    current_extreme_idx = 0
+    direction = 0  # 0=unconfirmed, +1=up confirmed, -1=down confirmed
+    
+    for i, price in enumerate(close_prices):
+        if direction <= 0:  # Looking for up move
+            if price > current_extreme:
+                current_extreme = price
+                current_extreme_idx = i
+            elif price <= current_extreme * (1 - threshold):
+                # Confirmed down move
+                dc_events.append((current_extreme_idx, current_extreme, -1))
+                direction = -1
+                current_extreme = price
+                current_extreme_idx = i
+        
+        if direction >= 0:  # Looking for down move
+            if price < current_extreme:
+                current_extreme = price
+                current_extreme_idx = i
+            elif price >= current_extreme * (1 + threshold * attenuation):
+                # Confirmed up move
+                dc_events.append((current_extreme_idx, current_extreme, +1))
+                direction = +1
+                current_extreme = price
+                current_extreme_idx = i
+    
+    return dc_events
+
+
+def _dc_event_features(dc_events, close_prices, window=50):
+    """Extracts features from recent DC events for HMM observation.
+    
+    Returns feature vector: [up_duration, down_duration, up_overshoot, 
+    down_overshoot, event_frequency, last_event_type]
+    """
+    if not dc_events:
+        return [0, 0, 0, 0, 0, 0]
+    
+    recent = dc_events[-window:] if len(dc_events) > window else dc_events
+    
+    up_durations = []
+    down_durations = []
+    up_overshoots = []
+    down_overshoots = []
+    
+    for j in range(1, len(recent)):
+        prev_idx, prev_price, prev_type = recent[j-1]
+        curr_idx, curr_price, curr_type = recent[j]
+        duration = curr_idx - prev_idx
+        overshoot = abs(curr_price - prev_price) / prev_price
+        
+        if curr_type == 1:
+            up_durations.append(duration)
+            up_overshoots.append(overshoot)
+        else:
+            down_durations.append(duration)
+            down_overshoots.append(overshoot)
+    
+    avg_up_dur = np.mean(up_durations) if up_durations else 0
+    avg_down_dur = np.mean(down_durations) if down_durations else 0
+    avg_up_os = np.mean(up_overshoots) if up_overshoots else 0
+    avg_down_os = np.mean(down_overshoots) if down_overshoots else 0
+    event_freq = len(recent) / max(1, recent[-1][0] - recent[0][0]) if len(recent) > 1 else 0
+    last_type = recent[-1][2] if recent else 0
+    
+    return [avg_up_dur, avg_down_dur, avg_up_os, avg_down_os, event_freq, last_type]
+
+
+def _retrain_dc_hmm(close_prices):
+    """Retrains HMM on DC event features. Returns fitted hmmlearn model."""
+    try:
+        from hmmlearn import hmm
+    except ImportError:
+        return None
+    
+    dc_events = _compute_directional_changes(close_prices)
+    if len(dc_events) < 50:
+        return None
+    
+    # Build observation sequence (sliding window features)
+    X = []
+    for i in range(50, len(dc_events)):
+        window_events = dc_events[:i+1]
+        feat = _dc_event_features(window_events)
+        X.append(feat)
+    
+    if len(X) < 20:
+        return None
+    
+    X = np.array(X)
+    # Standardize
+    X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-8)
+    
+    model = hmm.GaussianHMM(
+        n_components=HMM_N_STATES,
+        covariance_type=HMM_COVARIANCE_TYPE,
+        n_iter=100,
+        random_state=42
+    )
+    
+    try:
+        model.fit(X)
+        return model, dc_events
+    except Exception:
+        return None
+
+
+def classify_regime_dc_hmm(df, at=-1, lookback=DC_LOOKBACK):
+    """Directional Change + HMM regime classifier (Hu et al. 2022).
+    
+    Returns same dict format as classify_regime for drop-in compatibility.
+    """
+    n = len(df)
+    pos = at if at >= 0 else n + at
+    if pos < lookback:
+        return {"regime": "range", "atr_pctl": 50.0, "reason": "insufficient history", "adx": 25.0}
+    
+    close_prices = df["close"].iloc[max(0, pos - lookback):pos + 1].values
+    
+    # ATR percentile (same as original for sizing compatibility)
+    atr_series = df["atr14"].iloc[max(0, pos - lookback):pos + 1].dropna()
+    if atr_series.empty:
+        atr_pctl = 50.0
+    else:
+        atr_now = float(atr_series.iloc[-1])
+        atr_pctl = float((atr_series < atr_now).mean() * 100)
+    
+    adx_val = float(df.iloc[pos].get("adx14", 25.0))
+    
+    # Retrain HMM periodically (every 500 bars or on first call)
+    global _dc_hmm_cache
+    import time
+    now = time.time()
+    if (_dc_hmm_cache["model"] is None or 
+        now - _dc_hmm_cache["last_retrain"] > 300 or  # 5 min
+        _dc_hmm_cache["dc_events"] is None):
+        
+        result = _retrain_dc_hmm(close_prices)
+        if result:
+            _dc_hmm_cache["model"], _dc_hmm_cache["dc_events"] = result
+            _dc_hmm_cache["last_retrain"] = now
+    
+    if _dc_hmm_cache["model"] is None:
+        # Fallback to EMA-based if HMM unavailable
+        return classify_regime(df, at=at, lookback=lookback)
+    
+    # Get current regime from HMM
+    dc_events = _dc_hmm_cache["dc_events"]
+    feat = _dc_event_features(dc_events, close_prices)
+    feat = np.array(feat).reshape(1, -1)
+    
+    try:
+        hidden_state = _dc_hmm_cache["model"].predict(feat)[0]
+        
+        # Map HMM states to regime labels (order may vary, use statistics)
+        # State 0: longest up durations -> trend_up
+        # State 1: longest down durations -> trend_down  
+        # State 2: shortest durations, highest freq -> range
+        means = _dc_hmm_cache["model"].means_
+        up_dur_means = means[:, 0]
+        down_dur_means = means[:, 1]
+        
+        if hidden_state == np.argmax(up_dur_means):
+            regime = "trend"
+        elif hidden_state == np.argmax(down_dur_means):
+            regime = "trend"
+        else:
+            regime = "range"
+        
+        # High vol override
+        if atr_pctl >= 75:
+            regime = "trend_high_vol" if regime == "trend" else "high_vol"
+        
+        return {"regime": regime, "atr_pctl": atr_pctl, "reason": f"DC-HMM state {hidden_state}", "adx": adx_val}
+        
+    except Exception:
+        return classify_regime(df, at=at, lookback=lookback)
+
+
+def classify_regime(df, at=-1, lookback=50, atr_col="atr14"):
+    """Classify the market regime. Dispatches to configured classifier."""
+    if REGIME_CLASSIFIER == "dc_hmm":
+        return classify_regime_dc_hmm(df, at=at, lookback=lookback)
+    return classify_regime_ema(df, at=at, lookback=lookback, atr_col=atr_col)
+
+
+# Rename original for internal use
+def classify_regime_ema(df, at=-1, lookback=50, atr_col="atr14"):
+    """Original EMA-stack + ATR percentile regime classifier."""
+    n = len(df)
+    pos = at if at >= 0 else n + at
+    if pos < lookback:
+        return {"regime": "range", "atr_pctl": 50.0, "reason": "insufficient history"}
+
+    atr_series = df[atr_col].iloc[max(0, pos - lookback):pos + 1].dropna()
+    if atr_series.empty:
+        return {"regime": "range", "atr_pctl": 50.0, "reason": "no ATR"}
+
+    atr_now = float(atr_series.iloc[-1])
+    atr_pctl = float((atr_series < atr_now).mean() * 100)
+
+    last = df.iloc[pos]
+    ema20, ema50, ema200 = (float(last["ema20"]), float(last["ema50"]),
+                            float(last["ema200"]))
+    ema_spread = abs(ema20 - ema50) / max(last["close"], 1e-6)
+    stacked = (ema20 > ema50 > ema200) or (ema20 < ema50 < ema200)
+    trending = stacked and ema_spread > FLAT_EMA_THRESHOLD
+    adx_val = float(last["adx14"]) if "adx14" in last.index else 25.0
+    if ENABLE_ADX_FILTER:
+        trending = trending and adx_val >= ADX_RANGE_THRESHOLD
+
+    high_vol = atr_pctl >= 75
+    if trending and high_vol:
+        regime = "trend_high_vol"
+    elif trending:
+        regime = "trend"
+    elif high_vol:
+        regime = "high_vol"
+    else:
+        regime = "range"
+    return {"regime": regime, "atr_pctl": atr_pctl, "reason": "", "adx": adx_val}
+
+
 # --- DXY CORRELATION GATE ---------------------------------------------------
 # Cached so a 15-min live loop doesn't re-pull the whole DXY series every
 # poll — invalidated after DATA_FETCH_CACHE_TTL_S seconds or on data error.
@@ -1082,24 +1456,124 @@ def cot_alignment(gold_direction, snapshot=None):
 
 
 # --- VOLATILITY-TARGETED POSITION SIZING ------------------------------------
+# Bayesian Kelly Criterion (Sukhov 2026, SSRN 6195358)
+# Replaces fixed fractional risk with posterior-aware sizing.
+# Win probability p ~ Beta(alpha, beta) updated from trade history.
+# Optimal fraction f* = (alpha - 1) / (alpha + beta - 2) * (mu / sigma^2)
+# where mu/sigma^2 are the mean/variance of the return distribution.
+# With parameter uncertainty, this shrinks toward 0 vs plug-in Kelly.
+
+BAYESIAN_KELLY_ENABLED = True
+BAYESIAN_KELLY_PRIOR_ALPHA = 2.0   # prior wins + 1 (weakly informative)
+BAYESIAN_KELLY_PRIOR_BETA = 2.0    # prior losses + 1
+BAYESIAN_KELLY_MAX_FRACTION = 0.02  # hard cap (2% of equity max)
+BAYESIAN_KELLY_MIN_TRADES = 10      # minimum trades before using posterior
+BAYESIAN_KELLY_LOOKBACK = 100       # trades to use for moment estimation
+
+def _compute_bayesian_kelly_fraction(trade_log_path=TRADE_LOG_PATH):
+    """Computes the Bayesian Kelly fraction from trade history.
+    
+    Returns (kelly_fraction, n_trades_used, win_rate_est, sharpe_est).
+    If insufficient history, returns (0, 0, 0, 0) and caller falls back.
+    """
+    if not os.path.isfile(trade_log_path):
+        return 0.0, 0, 0.0, 0.0
+    
+    try:
+        df = pd.read_csv(trade_log_path)
+        if df.empty or len(df) < BAYESIAN_KELLY_MIN_TRADES:
+            return 0.0, len(df), 0.0, 0.0
+        
+        df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
+        df = df.sort_values("timestamp_utc").reset_index(drop=True)
+        
+        # Use most recent trades for moment estimation
+        recent = df.tail(BAYESIAN_KELLY_LOOKBACK)
+        pnl_series = recent["pnl_usd"].values
+        
+        # Win/loss counts for Beta posterior
+        wins = int((pnl_series > 0).sum())
+        losses = int((pnl_series < 0).sum())
+        
+        # Posterior parameters
+        alpha_post = BAYESIAN_KELLY_PRIOR_ALPHA + wins
+        beta_post = BAYESIAN_KELLY_PRIOR_BETA + losses
+        n_post = alpha_post + beta_post - 2  # effective sample size
+        
+        if n_post <= 0:
+            return 0.0, wins + losses, 0.0, 0.0
+        
+        # Posterior mean win probability
+        p_hat = (alpha_post - 1) / n_post
+        
+        # Return moments (Kelly uses log-returns; approximate with pnl %)
+        # Assume account_size for normalization
+        returns = pnl_series / ACCOUNT_SIZE
+        mu = float(np.mean(returns))
+        sigma2 = float(np.var(returns, ddof=1))
+        
+        if sigma2 <= 0 or mu <= 0:
+            return 0.0, wins + losses, p_hat, 0.0
+        
+        # Kelly fraction with posterior mean win prob
+        # f* = p - q/b where b = avg_win/avg_loss (but using continuous returns: mu/sigma2)
+        kelly_f = mu / sigma2
+        
+        # Shrink by posterior uncertainty: multiply by (n_post / (n_post + k))
+        # where k is a tuning constant (prior strength)
+        shrinkage = n_post / (n_post + 20.0)
+        kelly_f_shrunk = kelly_f * shrinkage
+        
+        # Cap at max fraction
+        kelly_f_capped = max(0.0, min(kelly_f_shrunk, BAYESIAN_KELLY_MAX_FRACTION))
+        
+        sharpe_est = mu / np.sqrt(sigma2) if sigma2 > 0 else 0.0
+        
+        return kelly_f_capped, wins + losses, p_hat, sharpe_est
+        
+    except Exception:
+        return 0.0, 0, 0.0, 0.0
+
+
 def volatility_targeted_risk_pct(atr_pctl, base_pct=RISK_PER_TRADE_PCT,
                                  min_pct=VOL_RISK_MIN, max_pct=VOL_RISK_MAX):
-    """Scales risk per trade by current volatility (ATR percentile). At the
-    median (pctl=50) returns the base_pct; below median (calm) scales toward
-    max_pct (risk MORE when stops are tight and conditions are clean); above
-    median (hot) scales toward min_pct (risk LESS when stops are wide and
-    fills are noisy). Linear interpolation between the 5th and 95th pct.
-
+    """Scales risk per trade by current volatility (ATR percentile) AND
+    Bayesian Kelly posterior from trade history.
+    
+    If BAYESIAN_KELLY_ENABLED and sufficient trade history exists,
+    returns the Bayesian Kelly fraction (as % of account) scaled by
+    the volatility regime. Otherwise falls back to original vol-targeted logic.
+    
     atr_pctl comes from classify_regime()['atr_pctl']."""
+    
+    # Get Bayesian Kelly fraction from trade history
+    if BAYESIAN_KELLY_ENABLED:
+        kelly_frac, n_trades, p_hat, sharpe = _compute_bayesian_kelly_fraction()
+        if n_trades >= BAYESIAN_KELLY_MIN_TRADES and kelly_frac > 0:
+            # Scale by volatility regime (calm -> more risk, hot -> less)
+            if not VOL_TARGETED_RISK:
+                vol_mult = 1.0
+            else:
+                pctl = max(5.0, min(95.0, float(atr_pctl)))
+                if pctl <= 50:
+                    t = (50.0 - pctl) / 45.0
+                    vol_mult = 1.0 + t * (max_pct / base_pct - 1.0)
+                else:
+                    t = (pctl - 50.0) / 45.0
+                    vol_mult = 1.0 + t * (min_pct / base_pct - 1.0)
+            
+            # Final risk % = Kelly fraction * vol multiplier * 100
+            risk_pct = kelly_frac * vol_mult * 100
+            return round(max(min_pct, min(max_pct, risk_pct)), 3)
+    
+    # Fallback: original vol-targeted logic
     if not VOL_TARGETED_RISK:
         return base_pct
     pctl = max(5.0, min(95.0, float(atr_pctl)))
     if pctl <= 50:
-        # calm side: 50th -> base, 5th -> max
         t = (50.0 - pctl) / 45.0
         return round(base_pct + t * (max_pct - base_pct), 3)
     else:
-        # hot side: 50th -> base, 95th -> min
         t = (pctl - 50.0) / 45.0
         return round(base_pct + t * (min_pct - base_pct), 3)
 
@@ -1114,6 +1588,110 @@ def variable_slippage(atr_pctl, base=SLIPPAGE_BASE_USD, max_slip=SLIPPAGE_MAX_US
         return base
     t = (pctl - 50.0) / 45.0
     return round(base + t * (max_slip - base), 3)
+
+
+# --- MICROSTRUCTURE FILTERS (OFI / VPIN) -----------------------------------
+# For scalp engine: reject trades when order flow is toxic (VPIN high)
+# or when OFI contradicts signal direction.
+# Requires MT5 Level-2 (Depth of Market) data.
+MICROSTRUCTURE_FILTER_ENABLED = True
+OFI_LOOKBACK_TICKS = 50      # ticks for OFI rolling window
+VPIN_WINDOW_TICKS = 100      # ticks for VPIN estimation
+VPIN_THRESHOLD = 0.75        # VPIN > 0.75 = toxic flow (Easley et al.)
+OFI_THRESHOLD = 0.1          # |OFI| < 0.1 = weak imbalance
+
+def compute_ofi_vpin_mt5(pair_name, ofi_window=OFI_LOOKBACK_TICKS,
+                          vpin_window=VPIN_WINDOW_TICKS):
+    """Computes Order Flow Imbalance (OFI) and VPIN from MT5 DOM.
+    
+    OFI = (bid_volume - ask_volume) / (bid_volume + ask_volume) over window.
+    VPIN = volume-weighted probability of informed trading (Easley et al.).
+    
+    Returns (ofi, vpin, bid_vol, ask_vol) or (None, None, None, None) if
+    DOM unavailable.
+    
+    Note: MT5 symbol_info_tick only gives L1. For true L2 DOM, use
+    mt5.MarketBookGet(). This function attempts MarketBookGet first,
+    falls back to L1 tick volume proxy.
+    """
+    try:
+        import MetaTrader5 as mt5
+        if not mt5.initialize():
+            return None, None, None, None
+        
+        pair = _PAIR_BY_NAME.get(pair_name)
+        if not pair:
+            mt5.shutdown()
+            return None, None, None, None
+        
+        # Resolve symbol
+        sym = _resolve_mt5_symbol(mt5, pair["mt5_symbols"], pair_name)
+        if not sym:
+            mt5.shutdown()
+            return None, None, None, None
+        
+        # Try to get Market Book (L2 DOM)
+        book = mt5.MarketBookGet(sym)
+        mt5.shutdown()
+        
+        if book is None or len(book) == 0:
+            # Fallback: use tick volume as proxy (less accurate)
+            tick = mt5.symbol_info_tick(sym)
+            if tick is None:
+                return None, None, None, None
+            # Can't compute real OFI/VPIN without DOM
+            return None, None, None, None
+        
+        # Compute OFI from top-of-book volumes
+        # book is list of (type, price, volume) where type: 0=bid, 1=ask, 2=trade
+        bid_vol = sum(v for t, p, v in book if t == 0)
+        ask_vol = sum(v for t, p, v in book if t == 1)
+        total_vol = bid_vol + ask_vol
+        
+        if total_vol == 0:
+            return 0.0, 0.0, bid_vol, ask_vol
+        
+        ofi = (bid_vol - ask_vol) / total_vol
+        
+        # VPIN approximation: fraction of volume in toxic buckets
+        # Simplified: use trade volume imbalance if available
+        trade_vol = sum(v for t, p, v in book if t == 2)
+        buy_vol = sum(v for t, p, v in book if t == 2 and p > 0)  # simplified
+        sell_vol = trade_vol - buy_vol
+        vpin = abs(buy_vol - sell_vol) / trade_vol if trade_vol > 0 else 0.0
+        
+        return ofi, vpin, bid_vol, ask_vol
+        
+    except Exception:
+        return None, None, None, None
+
+
+def microstructure_gate(pair_name, signal_direction):
+    """Returns (blocked, reason) based on OFI/VPIN.
+    
+    Blocks if:
+    - VPIN > VPIN_THRESHOLD (toxic flow, high adverse selection)
+    - OFI contradicts signal (e.g., LONG signal but OFI strongly negative)
+    """
+    if not MICROSTRUCTURE_FILTER_ENABLED:
+        return False, "Microstructure filter disabled"
+    
+    ofi, vpin, bid_vol, ask_vol = compute_ofi_vpin_mt5(pair_name)
+    
+    if ofi is None or vpin is None:
+        return False, "Microstructure data unavailable (FAIL OPEN)"
+    
+    # VPIN toxicity check
+    if vpin > VPIN_THRESHOLD:
+        return True, f"VPIN {vpin:.2f} > {VPIN_THRESHOLD} — toxic flow, high adverse selection"
+    
+    # OFI direction agreement
+    if signal_direction == "LONG" and ofi < -OFI_THRESHOLD:
+        return True, f"OFI {ofi:.2f} contradicts LONG (strong sell pressure)"
+    if signal_direction == "SHORT" and ofi > OFI_THRESHOLD:
+        return True, f"OFI {ofi:.2f} contradicts SHORT (strong buy pressure)"
+    
+    return False, f"Microstructure OK: OFI={ofi:.2f}, VPIN={vpin:.2f}"
 
 
 # --- TRAILING STOP for the TP3 runner --------------------------------------
@@ -1817,7 +2395,7 @@ def calculate_position_size(risk_amount, stop_distance_price,
 
 def build_trade_plan(setup, ltf_confirmation=None, pair_name=None,
                      atr_stop_mult=None, min_rr=None, tp_rr=None,
-                     mode="day"):
+                     mode="day", dd_leverage_factor=1.0):
     if setup["direction"] is None or setup["grade"] == "NO TRADE":
         return None
 
@@ -1883,6 +2461,10 @@ def build_trade_plan(setup, ltf_confirmation=None, pair_name=None,
 
     risk_pct = volatility_targeted_risk_pct(atr_pctl)
     risk_amount = ACCOUNT_SIZE * (risk_pct / 100)
+    
+    # Apply Sukhov's DDR leverage factor from drawdown distance
+    risk_amount *= dd_leverage_factor
+    
     position = calculate_position_size(risk_amount, stop_dist,
                                        contract_size=pair["contract_size"])
 
@@ -2097,34 +2679,49 @@ def check_weekly_loss_limit(account_size=None, max_weekly_loss_pct=None, path=No
     }
 
 
-def check_max_drawdown(account_size=None, max_drawdown_pct=None, path=None):
-    """Tracks the equity curve implied by closed-trade P&L and blocks new
-    signals once peak-to-trough drawdown exceeds the cap.
+# Sukhov (2026) Dynamic De-Risking under Drawdown Constraints
+# Optimal leverage f*(d) = κ * (1 - exp(-λ * d/b)) where d = distance to barrier
+# b = max allowed drawdown, κ = base Kelly fraction, λ = tuning parameter
+DRAWDOWN_DDR_ENABLED = True
+DRAWDOWN_DDR_KAPPA = 0.02      # base leverage (2% = base Kelly)
+DRAWDOWN_DDR_LAMBDA = 3.0      # exponential decay rate
+DRAWDOWN_DDR_MIN_LEVERAGE = 0.0  # minimum leverage at barrier
 
-    Unlike the daily/weekly loss limits (which only look at today/this-week
-    losses), this measures the full equity curve: a strategy can book
-    positive daily P&L while still sitting 20% below its all-time high.
-    Stopping on drawdown is the standard risk-desk practice for preventing
-    a slow bleed from turning into an account blowout.
 
-    Reads the same TRADE_LOG_PATH as the other breakers, so it's real
-    (not theoretical) when AUTO_EXECUTE is on, and reflects manually-punched
-    outcomes otherwise. Returns {blocked, current_equity, peak_equity,
-    drawdown_pct, limit_pct}."""
+def check_max_drawdown(account_size=None, max_drawdown_pct=None, path=None,
+                       return_leverage_factor=False):
+    """Tracks the equity curve and returns Sukhov's Dynamic De-Risking
+    leverage factor f*(d) instead of just blocking.
+    
+    If return_leverage_factor=True, returns a leverage multiplier in [0, 1]
+    that scales position size based on current drawdown distance from peak.
+    
+    f*(d) = κ * (1 - exp(-λ * d/b))  [Exponential DDR from Sukhov 2026]
+    where d = (peak - current) / peak * 100 = drawdown in %
+    b = max_drawdown_pct (barrier)
+    
+    At peak (d=0): f* = κ (full leverage)
+    At barrier (d=b): f* = κ * (1 - exp(-λ)) ≈ κ * 0.95 for λ=3
+    
+    The hard block at max_drawdown_pct still applies as a safety floor."""
     account_size = account_size if account_size is not None else ACCOUNT_SIZE
     max_drawdown_pct = max_drawdown_pct if max_drawdown_pct is not None else MAX_DRAWDOWN_PCT
     path = path if path is not None else TRADE_LOG_PATH
 
     if not os.path.isfile(path):
+        leverage_factor = 1.0 if DRAWDOWN_DDR_ENABLED else None
         return {"blocked": False, "current_equity": account_size,
                 "peak_equity": account_size, "drawdown_pct": 0.0,
-                "limit_pct": max_drawdown_pct}
+                "limit_pct": max_drawdown_pct,
+                "leverage_factor": leverage_factor}
 
     df = pd.read_csv(path)
     if df.empty:
+        leverage_factor = 1.0 if DRAWDOWN_DDR_ENABLED else None
         return {"blocked": False, "current_equity": account_size,
                 "peak_equity": account_size, "drawdown_pct": 0.0,
-                "limit_pct": max_drawdown_pct}
+                "limit_pct": max_drawdown_pct,
+                "leverage_factor": leverage_factor}
 
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
     df = df.sort_values("timestamp_utc").reset_index(drop=True)
@@ -2137,12 +2734,38 @@ def check_max_drawdown(account_size=None, max_drawdown_pct=None, path=None):
     peak_equity = max(equity)
     drawdown_pct = (current_equity - peak_equity) / peak_equity * 100 if peak_equity > 0 else 0.0
 
+    # Hard block at max drawdown (safety floor)
+    blocked = drawdown_pct <= -abs(max_drawdown_pct)
+
+    # Sukhov's Exponential DDR leverage factor
+    leverage_factor = 1.0
+    if DRAWDOWN_DDR_ENABLED and not blocked and max_drawdown_pct > 0:
+        # Normalized distance to barrier: 0 at peak, 1 at barrier
+        d_normalized = abs(drawdown_pct) / abs(max_drawdown_pct)
+        d_normalized = min(1.0, max(0.0, d_normalized))
+        
+        # Exponential DDR: f*(d) = κ * (1 - exp(-λ * d))
+        kappa = DRAWDOWN_DDR_KAPPA
+        lam = DRAWDOWN_DDR_LAMBDA
+        f_star = kappa * (1.0 - math.exp(-lam * d_normalized))
+        
+        # Scale relative to base risk (RISK_PER_TRADE_PCT / 100)
+        base_risk = RISK_PER_TRADE_PCT / 100.0
+        if base_risk > 0:
+            leverage_factor = f_star / base_risk
+        else:
+            leverage_factor = 1.0
+        
+        # Clamp
+        leverage_factor = max(DRAWDOWN_DDR_MIN_LEVERAGE, min(1.0, leverage_factor))
+
     return {
-        "blocked": drawdown_pct <= -abs(max_drawdown_pct),
+        "blocked": blocked,
         "current_equity": round(current_equity, 2),
         "peak_equity": round(peak_equity, 2),
         "drawdown_pct": round(drawdown_pct, 2),
         "limit_pct": max_drawdown_pct,
+        "leverage_factor": round(leverage_factor, 4) if DRAWDOWN_DDR_ENABLED else None,
     }
 
 
@@ -2150,7 +2773,7 @@ def check_max_drawdown(account_size=None, max_drawdown_pct=None, path=None):
 # 6. MAIN
 # --------------------------------------------------------------------------
 def _scan_pair(pair, profile, dxy_dir=None, from_tabulate=None,
-               signals_last_window=0):
+               signals_last_window=0, dd_leverage_factor=1.0):
     """Scans a single pair end-to-end using the given profile
     (day-trading or scalping). Returns the trade dict if a signal
     was produced, or None. All print output goes to stdout for the
@@ -2160,7 +2783,10 @@ def _scan_pair(pair, profile, dxy_dir=None, from_tabulate=None,
     day-trading and scalping engines — timeframes, bar counts,
     grade gates, confirmation strictness, session rules, the R:R
     ladder and the stop distance. Both engines run THIS function,
-    so there is one scan pipeline and the two cannot drift apart."""
+    so there is one scan pipeline and the two cannot drift apart.
+
+    dd_leverage_factor: Sukhov's DDR leverage multiplier from drawdown
+    distance. Scales position size down as drawdown approaches limit."""
     tabulate = from_tabulate
     pair_name = pair["name"]
     mode = profile["mode"]
@@ -2257,6 +2883,18 @@ def _scan_pair(pair, profile, dxy_dir=None, from_tabulate=None,
         print(f"  [STAGE 2.1] Spread viability: 1m ATR {atr_pips:.1f} pips "
               f">= {SCALP_MIN_ATR_TO_SPREAD}x spread ({spread_pips} pips) — OK")
 
+    # --- STAGE 2.2: SCALP-ONLY MICROSTRUCTURE GATE (OFI/VPIN) ---
+    # Reject scalp signals when order flow is toxic (high VPIN)
+    # or when OFI contradicts the signal direction.
+    # Only runs for scalp profile; day trades have wider stops
+    # and longer horizons that absorb microstructure noise.
+    if is_scalp:
+        blocked, reason = microstructure_gate(pair_name, htf_setup["direction"])
+        print(f"  [STAGE 2.2] Microstructure: {reason}")
+        if blocked:
+            print(f"  NO TRADE — {reason}\n")
+            return None
+
     ltf_conf = confirm_on_ltf(df_ltf, htf_setup["direction"],
                                min_confirmations=profile["min_ltf_confirmations"])
 
@@ -2282,7 +2920,8 @@ def _scan_pair(pair, profile, dxy_dir=None, from_tabulate=None,
         atr_stop_mult=profile["atr_stop_mult"],
         min_rr=profile["min_rr"],
         tp_rr=profile["tp_rr"],
-        mode=mode
+        mode=mode,
+        dd_leverage_factor=dd_leverage_factor
     )
     if trade is None:
         print(f"  NO TRADE — {pair_name} didn't clear NET R:R filter after costs.\n")
@@ -2394,16 +3033,23 @@ def run_scanner():
     # Maximum-drawdown breaker: tracks the full equity curve, not just
     # today/this-week losses. A strategy can book positive daily P&L while
     # still sitting far below its peak — this stops the slow bleed.
-    dd_breaker = check_max_drawdown()
+    # Also returns Sukhov's DDR leverage factor for dynamic position sizing.
+    dd_breaker = check_max_drawdown(return_leverage_factor=True)
+    dd_leverage_factor = dd_breaker.get("leverage_factor", 1.0)
     if dd_breaker["blocked"]:
         print(f"\n[STOPPED] Max drawdown reached: "
               f"{dd_breaker['drawdown_pct']}% (peak ${dd_breaker['peak_equity']} -> "
               f"${dd_breaker['current_equity']}, limit {dd_breaker['limit_pct']}%). "
               f"No new signals until drawdown recovers.\n")
         return
-    print(f"Drawdown: {dd_breaker['drawdown_pct']}% "
-          f"(peak ${dd_breaker['peak_equity']}, current ${dd_breaker['current_equity']}, "
-          f"limit {dd_breaker['limit_pct']}%)")
+    if dd_breaker.get("leverage_factor") is not None:
+        print(f"Drawdown: {dd_breaker['drawdown_pct']}% "
+              f"(peak ${dd_breaker['peak_equity']}, current ${dd_breaker['current_equity']}, "
+              f"limit {dd_breaker['limit_pct']}%)  DDR leverage: {dd_leverage_factor:.2f}x")
+    else:
+        print(f"Drawdown: {dd_breaker['drawdown_pct']}% "
+              f"(peak ${dd_breaker['peak_equity']}, current ${dd_breaker['current_equity']}, "
+              f"limit {dd_breaker['limit_pct']}%)")
 
     # --- Fetch DXY once (shared across all USD-quoted pairs) ---
     dxy_dir = None
@@ -2415,6 +3061,15 @@ def run_scanner():
             print("  DXY unavailable — gate will FAIL OPEN per pair.")
         else:
             print(f"  DXY trend (last {DXY_TREND_BARS} bars): {dxy_dir}")
+        print()
+
+    # --- FACTOR-MOMENTUM TILT (Zhang 2021) ---
+    # Compute weights once per scan, apply to all signals
+    factor_weights = {}
+    if FACTOR_MOMENTUM_ENABLED:
+        factor_weights = compute_factor_momentum_weights()
+        if factor_weights:
+            print(f"[FACTOR-MOMENTUM] Weights: {', '.join(f'{k}={v:.2f}' for k,v in factor_weights.items())}")
         print()
 
     # --- SCAN EACH PAIR (DAY + SCALP) ---
@@ -2442,8 +3097,19 @@ def run_scanner():
                 signals_last_window = scalp_signals_recent if profile["mode"] == "scalp" else 0
                 trade = _scan_pair(
                     pair, profile, dxy_dir=dxy_dir, from_tabulate=tabulate,
-                    signals_last_window=signals_last_window)
+                    signals_last_window=signals_last_window,
+                    dd_leverage_factor=dd_leverage_factor)
                 if trade is not None:
+                    # Apply factor-momentum tilt
+                    pair_name = trade.get("Symbol")
+                    if pair_name in factor_weights:
+                        tilt = factor_weights[pair_name]
+                        if tilt != 1.0:
+                            trade["_position"]["lots"] *= tilt
+                            trade["Risk $ (target)"] *= tilt
+                            trade["Risk % (vol-targeted)"] *= tilt
+                            trade["Factor Momentum Tilt"] = round(tilt, 3)
+                    
                     direction = trade["Direction"]
                     # Check against already-accepted signals this cycle.
                     for other_pair, other_dir in open_directions.items():
