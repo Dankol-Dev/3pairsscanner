@@ -1,5 +1,5 @@
 import { useEffect, useState, useMemo } from 'react';
-import { Grid3x3, RefreshCw, TrendingUp, AlertTriangle } from 'lucide-react';
+import { Grid3x3, RefreshCw, TrendingUp, AlertTriangle, Award, ChevronRight } from 'lucide-react';
 
 type SweepRow = {
   profile: string;
@@ -74,6 +74,17 @@ export function SweepTable() {
     const scalpRows = rows.filter(r => r.profile === 'scalp');
     const dayProf = dayRows.filter(r => r.expectancy_r > 0);
     const scalpProf = scalpRows.filter(r => r.expectancy_r > 0);
+
+    const tradeable = rows.filter(r => r.trades > 0);
+    let best: SweepRow | null = null;
+    if (tradeable.length > 0) {
+      best = tradeable.reduce((top, row) => {
+        const topScore = top.expectancy_r * (top.profit_factor > 0 ? top.profit_factor : 0.01);
+        const rowScore = row.expectancy_r * (row.profit_factor > 0 ? row.profit_factor : 0.01);
+        return rowScore > topScore ? row : top;
+      });
+    }
+
     return {
       total: rows.length,
       profitable: profitable.length,
@@ -84,6 +95,7 @@ export function SweepTable() {
       scalpProf: scalpProf.length,
       bestExpectancy: Math.max(...rows.map(r => r.expectancy_r)),
       worstExpectancy: Math.min(...rows.map(r => r.expectancy_r)),
+      best,
     };
   }, [rows]);
 
@@ -147,6 +159,67 @@ export function SweepTable() {
 
   return (
     <div className="space-y-4">
+      {/* Best configuration highlight */}
+      {summary?.best && (
+        <div className="rounded-xl border border-emerald-800/50 bg-gradient-to-br from-emerald-950/40 via-slate-900/60 to-slate-900/40 p-5">
+          <div className="flex items-start gap-4 flex-wrap">
+            <div className="flex items-center gap-3">
+              <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-emerald-400 to-emerald-600 flex items-center justify-center shadow-lg shadow-emerald-500/20">
+                <Award className="w-5 h-5 text-slate-900" />
+              </div>
+              <div>
+                <p className="text-xs font-medium text-emerald-400 uppercase tracking-wider">Best Configuration</p>
+                <p className="text-sm text-slate-300 mt-0.5">
+                  {summary.best.profile === 'scalp' ? 'Scalp' : 'Day'} ·{' '}
+                  <span className={pairColor(summary.best.pair)}>{summary.best.pair}</span> ·{' '}
+                  Grade {summary.best.min_grade} ·{' '}
+                  RR {summary.best.min_rr.toFixed(1)} ·{' '}
+                  ATR {summary.best.atr_stop_mult.toFixed(1)}x
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-5 ml-auto">
+              <div className="text-right">
+                <p className="text-xs text-slate-500">Expectancy</p>
+                <p className="text-lg font-bold text-emerald-400 tabular-nums">
+                  {summary.best.expectancy_r.toFixed(3)}R
+                </p>
+              </div>
+              <div className="text-right">
+                <p className="text-xs text-slate-500">Profit Factor</p>
+                <p className="text-lg font-bold text-emerald-400 tabular-nums">
+                  {summary.best.profit_factor.toFixed(2)}
+                </p>
+              </div>
+              <div className="text-right">
+                <p className="text-xs text-slate-500">Win Rate</p>
+                <p className="text-lg font-bold tabular-nums text-slate-200">
+                  {summary.best.win_rate.toFixed(1)}%
+                </p>
+              </div>
+              <div className="text-right">
+                <p className="text-xs text-slate-500">Trades</p>
+                <p className="text-lg font-bold tabular-nums text-slate-200">{summary.best.trades}</p>
+              </div>
+              <div className="text-right">
+                <p className="text-xs text-slate-500">Max DD</p>
+                <p className="text-lg font-bold tabular-nums text-amber-400">
+                  {summary.best.max_dd_pct.toFixed(1)}%
+                </p>
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 mt-3 pt-3 border-t border-emerald-800/30 text-xs text-slate-500">
+            <ChevronRight className="w-3 h-3" />
+            <span>
+              Scored by expectancy × profit factor.{' '}
+              {summary.best.tp_rr && summary.best.tp_rr !== '—' && `TP ladder: ${summary.best.tp_rr}.  `}
+              Treat as in-sample best — verify it holds in the walk-forward tab before trading.
+            </span>
+          </div>
+        </div>
+      )}
+
       {/* Summary */}
       {summary && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -287,6 +360,13 @@ export function SweepTable() {
   );
 }
 
+function pairColor(pair: string): string {
+  if (pair === 'EURUSD') return 'text-sky-400';
+  if (pair === 'AUDUSD') return 'text-emerald-400';
+  if (pair === 'GBPUSD') return 'text-violet-400';
+  return 'text-slate-400';
+}
+
 function gradeColor(grade: string): string {
   if (grade.includes('A+')) return 'bg-emerald-500/20 text-emerald-300 border border-emerald-700';
   if (grade.includes('A')) return 'bg-amber-500/20 text-amber-300 border border-amber-700';
@@ -348,3 +428,6 @@ function parseCsv(text: string): SweepRow[] {
 
   return rows;
 }
+
+
+export { SweepTable }
