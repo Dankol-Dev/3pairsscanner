@@ -535,9 +535,21 @@ SLIPPAGE_MAX_USD = 0.0002        # legacy alias (2.0 pips * 0.0001)
 # Blocks trend-following signals during low-quality sessions (Asian/closed).
 # Options: "london_ny", "london", "overlap", "any"
 ENABLE_SESSION_FILTER = True
-# Day-trading: accept London, NY, and Asian sessions (AUDUSD is active
-# in the Asian session). Overlap remains the highest quality.
-REQUIRED_SESSION = "any"
+# Day-trading: only London and New York sessions have enough liquidity for
+# reliable breakouts on EURUSD/GBPUSD. The Asian session is thin and prone
+# to false breakouts, and "closed" hours have minimal institutional flow.
+REQUIRED_SESSION = "london_ny"
+
+# Scalping requires the tightest liquidity — restrict to the London/NY
+# overlap only (the highest-volume window), where spreads are narrowest
+# and false breakouts are least likely.
+SCALP_REQUIRED_SESSION = "overlap"
+
+# Session-edge buffer (minutes). Reject signals this many minutes before
+# session close and after session open — the first/last minutes of a
+# session have erratic liquidity transitions (spreads widen, institutional
+# flow hasn't arrived or has already left) that produce false breakouts.
+SESSION_EDGE_BUFFER_MIN = 10
 
 
 # --------------------------------------------------------------------------
@@ -1962,9 +1974,36 @@ def get_trading_session(ts):
     return "closed"
 
 
-def session_allows_signal(ts, required=REQUIRED_SESSION):
+def _session_boundaries(ts):
+    """Returns (open, close) UTC timestamps for the session that `ts` falls
+    inside, or (None, None) if the market is 'closed'."""
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    ts_utc = ts.tz_convert("UTC")
+    day = ts_utc.date()
+    london_open = pd.Timestamp(day, tz=ZoneInfo("Europe/London")).replace(hour=8, minute=0).tz_convert("UTC")
+    london_close = pd.Timestamp(day, tz=ZoneInfo("Europe/London")).replace(hour=16, minute=30).tz_convert("UTC")
+    ny_open = pd.Timestamp(day, tz=ZoneInfo("America/New_York")).replace(hour=8, minute=0).tz_convert("UTC")
+    ny_close = pd.Timestamp(day, tz=ZoneInfo("America/New_York")).replace(hour=17, minute=0).tz_convert("UTC")
+    overlap_start = max(london_open, ny_open)
+    overlap_end = min(london_close, ny_close)
+    if overlap_start <= ts_utc <= overlap_end:
+        return overlap_start, overlap_end, "overlap"
+    if london_open <= ts_utc <= london_close:
+        return london_open, london_close, "london"
+    if ny_open <= ts_utc <= ny_close:
+        return ny_open, ny_close, "new_york"
+    return None, None, "closed"
+
+
+def session_allows_signal(ts, required=REQUIRED_SESSION,
+                           edge_buffer_min=SESSION_EDGE_BUFFER_MIN):
     """Checks whether the current session meets the required quality
-    threshold for trend-following signals."""
+    threshold for trend-following signals. Also rejects signals within
+    `edge_buffer_min` minutes of a session open or close — those edge
+    minutes have erratic liquidity transitions (widening spreads,
+    incomplete institutional flow) that produce false breakouts."""
     if not ENABLE_SESSION_FILTER:
         return True, "session filter off"
     session = get_trading_session(ts)
@@ -1975,9 +2014,21 @@ def session_allows_signal(ts, required=REQUIRED_SESSION):
         "overlap": ("overlap",),
     }
     allowed = _valid.get(required, _valid["london_ny"])
-    if session in allowed:
-        return True, f"session={session} (meets required={required})"
-    return False, f"session={session} (requires {required} — low-quality for trend signals)"
+    if session not in allowed:
+        return False, f"session={session} (requires {required} — low-quality for trend signals)"
+    if edge_buffer_min > 0:
+        s_open, s_close, _ = _session_boundaries(ts)
+        if s_open is not None:
+            ts_utc = ts.tz_convert("UTC") if ts.tzinfo is not None else ts.tz_localize("UTC")
+            mins_after_open = (ts_utc - s_open).total_seconds() / 60.0
+            mins_before_close = (s_close - ts_utc).total_seconds() / 60.0
+            if mins_after_open < edge_buffer_min:
+                return False, (f"session={session} but within {edge_buffer_min}m "
+                               f"of open ({mins_after_open:.0f}m elapsed) — edge buffer")
+            if mins_before_close < edge_buffer_min:
+                return False, (f"session={session} but within {edge_buffer_min}m "
+                               f"of close ({mins_before_close:.0f}m left) — edge buffer")
+    return True, f"session={session} (meets required={required})"
 
 
 def is_news_blackout(ts, windows=None):
@@ -2996,7 +3047,7 @@ SCALP_PROFILE = {
     "atr_stop_mult": SCALP_ATR_STOP_MULT,
     "min_rr": SCALP_MIN_RR,
     "tp_rr": (SCALP_TP1_RR, SCALP_TP2_RR, SCALP_TP3_RR),
-    "required_session": REQUIRED_SESSION,  # same session filter
+    "required_session": SCALP_REQUIRED_SESSION,
     "max_hold_bars": SCALP_MAX_HOLD_BARS,
 }
 
