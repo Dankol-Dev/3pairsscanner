@@ -3,6 +3,7 @@ import {
   TrendingUp, TrendingDown, Activity, Target, Clock,
   CheckCircle2, AlertCircle, DollarSign, Percent,
   RefreshCw, ArrowUpRight, ArrowDownRight, Zap,
+  Grid3x3, GitBranch,
 } from 'lucide-react';
 import { supabase, type Signal, type Trade } from './lib/supabase';
 import { StatsCards } from './components/StatsCards';
@@ -10,6 +11,8 @@ import { SignalsTable } from './components/SignalsTable';
 import { TradesPanel } from './components/TradesPanel';
 import { ManualTradeModal } from './components/ManualTradeModal';
 import { LivePriceCard } from './components/LivePriceCard';
+import { SweepTable } from './components/SweepTable';
+import { WalkforwardTable } from './components/WalkforwardTable';
 
 function App() {
   const [signals, setSignals] = useState<Signal[]>([]);
@@ -19,6 +22,7 @@ function App() {
   const [showManualModal, setShowManualModal] = useState(false);
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
   const [livePrice, setLivePrice] = useState<number | null>(null);
+  const [activeTab, setActiveTab] = useState<'signals' | 'sweep' | 'walkforward'>('signals');
 
   const fetchData = useCallback(async () => {
     setError(null);
@@ -100,6 +104,34 @@ function App() {
         </div>
       </header>
 
+      {/* Tab navigation */}
+      <div className="border-b border-slate-800 bg-slate-900/30">
+        <div className="max-w-7xl mx-auto px-6 flex gap-1">
+          {[
+            { key: 'signals', label: 'Signals', icon: Target },
+            { key: 'sweep', label: 'Parameter Sweep', icon: Grid3x3 },
+            { key: 'walkforward', label: 'Walk-Forward', icon: GitBranch },
+          ].map(tab => {
+            const Icon = tab.icon;
+            const active = activeTab === tab.key;
+            return (
+              <button
+                key={tab.key}
+                onClick={() => setActiveTab(tab.key as typeof activeTab)}
+                className={`flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
+                  active
+                    ? 'border-sky-500 text-sky-300'
+                    : 'border-transparent text-slate-400 hover:text-slate-200 hover:border-slate-700'
+                }`}
+              >
+                <Icon className="w-4 h-4" />
+                {tab.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       <main className="max-w-7xl mx-auto px-6 py-8 space-y-8">
         {error && (
           <div className="flex items-center gap-3 p-4 rounded-xl bg-red-950/50 border border-red-800 text-red-200">
@@ -108,6 +140,7 @@ function App() {
           </div>
         )}
 
+        {/* Always-visible live prices + stats */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-1">
             <LivePriceCard onPriceUpdate={(price) => setLivePrice(price)} />
@@ -117,33 +150,64 @@ function App() {
           </div>
         </div>
 
-        {openTrades.length > 0 && (
-          <TradesPanel
-            trades={openTrades}
-            title="Open Trades"
-            isOpen
-            onUpdate={fetchData}
-          />
+        {/* Signals tab content */}
+        {activeTab === 'signals' && (
+          <>
+            {openTrades.length > 0 && (
+              <TradesPanel
+                trades={openTrades}
+                title="Open Trades"
+                isOpen
+                onUpdate={fetchData}
+              />
+            )}
+
+            <div>
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-2">
+                  <Target className="w-5 h-5 text-sky-400" />
+                  <h2 className="text-base font-semibold">Recent Signals</h2>
+                  <span className="text-xs text-slate-500">({signals.length})</span>
+                </div>
+              </div>
+              <SignalsTable signals={signals} livePrice={livePrice} />
+            </div>
+
+            {closedTrades.length > 0 && (
+              <TradesPanel
+                trades={closedTrades}
+                title="Trade History"
+                isOpen={false}
+                onUpdate={fetchData}
+              />
+            )}
+          </>
         )}
 
-        <div>
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2">
-              <Target className="w-5 h-5 text-sky-400" />
-              <h2 className="text-base font-semibold">Recent Signals</h2>
-              <span className="text-xs text-slate-500">({signals.length})</span>
+        {/* Parameter sweep tab content */}
+        {activeTab === 'sweep' && (
+          <div>
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <Grid3x3 className="w-5 h-5 text-sky-400" />
+                <h2 className="text-base font-semibold">Parameter Sensitivity Sweep</h2>
+              </div>
             </div>
+            <SweepTable />
           </div>
-          <SignalsTable signals={signals} livePrice={livePrice} />
-        </div>
+        )}
 
-        {closedTrades.length > 0 && (
-          <TradesPanel
-            trades={closedTrades}
-            title="Trade History"
-            isOpen={false}
-            onUpdate={fetchData}
-          />
+        {/* Walk-forward tab content */}
+        {activeTab === 'walkforward' && (
+          <div>
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <GitBranch className="w-5 h-5 text-sky-400" />
+                <h2 className="text-base font-semibold">Walk-Forward Analysis</h2>
+              </div>
+            </div>
+            <WalkforwardTable />
+          </div>
         )}
       </main>
 
